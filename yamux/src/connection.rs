@@ -31,6 +31,7 @@ use futures::stream::SelectAll;
 use futures::{channel::mpsc, future::Either, prelude::*, sink::SinkExt, stream::Fuse};
 use nohash_hasher::IntMap;
 use parking_lot::Mutex;
+use std::collections::VecDeque;
 use std::task::{Context, Waker};
 use std::{fmt, sync::Arc, task::Poll};
 
@@ -285,7 +286,8 @@ struct Active<T> {
     stream_receivers: SelectAll<TaggedStream<StreamId, mpsc::Receiver<StreamCommand>>>,
     no_streams_waker: Option<Waker>,
 
-    pending_frame: Option<Frame<()>>,
+    pending_read_frame: Option<Frame<()>>,
+    pending_write_frame: Option<Frame<()>>,
     new_outbound_stream_waker: Option<Waker>,
 
     rtt: rtt::Rtt,
@@ -359,7 +361,8 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Active<T> {
                 Mode::Client => 1,
                 Mode::Server => 2,
             },
-            pending_frame: None,
+            pending_read_frame: None,
+            pending_write_frame: None,
             new_outbound_stream_waker: None,
             rtt: rtt::Rtt::new(),
             accumulated_max_stream_windows: Default::default(),
@@ -368,7 +371,12 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Active<T> {
 
     /// Gracefully close the connection to the remote.
     fn close(self) -> Closing<T> {
-        Closing::new(self.stream_receivers, self.pending_frame, self.socket)
+        let pending_frames = self
+            .pending_read_frame
+            .into_iter()
+            .chain(self.pending_write_frame)
+            .collect::<VecDeque<Frame<()>>>();
+        Closing::new(self.stream_receivers, pending_frames, self.socket)
     }
 
     /// Cleanup all our resources.
@@ -391,7 +399,13 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Active<T> {
                     continue;
                 }
 
-                if let Some(frame) = self.pending_frame.take() {
+                // Privilege pending `Pong` and `GoAway` `Frame`s
+                // over `Frame`s from the receivers.
+                if let Some(frame) = self
+                    .pending_read_frame
+                    .take()
+                    .or_else(|| self.pending_write_frame.take())
+                {
                     self.socket.start_send_unpin(frame)?;
                     continue;
                 }
@@ -402,35 +416,60 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Active<T> {
                 Poll::Pending => {}
             }
 
-            if self.pending_frame.is_none() {
+            if self.pending_write_frame.is_none() {
+                match self.stream_receivers.poll_next_unpin(cx) {
+                    Poll::Ready(Some((_, Some(StreamCommand::SendFrame(frame))))) => {
+                        log::trace!(
+                            "{}/{}: sending: {}",
+                            self.id,
+                            frame.header().stream_id(),
+                            frame.header()
+                        );
+                        self.pending_write_frame.replace(frame.into());
+                        continue;
+                    }
+                    Poll::Ready(Some((id, Some(StreamCommand::CloseStream { ack })))) => {
+                        log::trace!("{}/{}: sending close", self.id, id);
+                        self.pending_write_frame
+                            .replace(Frame::close_stream(id, ack).into());
+                        continue;
+                    }
+                    Poll::Ready(Some((id, None))) => {
+                        if let Some(frame) = self.on_drop_stream(id) {
+                            log::trace!("{}/{}: sending: {}", self.id, id, frame.header());
+                            self.pending_write_frame.replace(frame);
+                        };
+                        continue;
+                    }
+                    Poll::Ready(None) => {
+                        self.no_streams_waker = Some(cx.waker().clone());
+                    }
+                    Poll::Pending => {}
+                }
+            }
+
+            if self.pending_read_frame.is_none() {
                 match self.socket.poll_next_unpin(cx) {
                     Poll::Ready(Some(frame)) => {
-                        if let Some(stream) = self.on_frame(frame?)? {
-                            return Poll::Ready(Ok(stream));
+                        match self.on_frame(frame?)? {
+                            Action::None => {}
+                            Action::New(stream) => {
+                                log::trace!("{}: new inbound {} of {}", self.id, stream, self);
+                                return Poll::Ready(Ok(stream));
+                            }
+                            Action::Ping(f) => {
+                                log::trace!("{}/{}: pong", self.id, f.header().stream_id());
+                                self.pending_read_frame.replace(f.into());
+                            }
+                            Action::Terminate(f) => {
+                                log::trace!("{}: sending term", self.id);
+                                self.pending_read_frame.replace(f.into());
+                            }
                         }
                         continue;
                     }
                     Poll::Ready(None) => {
                         return Poll::Ready(Err(ConnectionError::Closed));
-                    }
-                    Poll::Pending => {}
-                }
-
-                match self.stream_receivers.poll_next_unpin(cx) {
-                    Poll::Ready(Some((_, Some(StreamCommand::SendFrame(frame))))) => {
-                        self.on_send_frame(frame);
-                        continue;
-                    }
-                    Poll::Ready(Some((id, Some(StreamCommand::CloseStream { ack })))) => {
-                        self.on_close_stream(id, ack);
-                        continue;
-                    }
-                    Poll::Ready(Some((id, None))) => {
-                        self.on_drop_stream(id);
-                        continue;
-                    }
-                    Poll::Ready(None) => {
-                        self.no_streams_waker = Some(cx.waker().clone());
                     }
                     Poll::Pending => {}
                 }
@@ -464,23 +503,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Active<T> {
         Poll::Ready(Ok(stream))
     }
 
-    fn on_send_frame(&mut self, frame: Frame<Either<Data, WindowUpdate>>) {
-        log::trace!(
-            "{}/{}: sending: {}",
-            self.id,
-            frame.header().stream_id(),
-            frame.header()
-        );
-        self.pending_frame.replace(frame.into());
-    }
-
-    fn on_close_stream(&mut self, id: StreamId, ack: bool) {
-        log::trace!("{}/{}: sending close", self.id, id);
-        self.pending_frame
-            .replace(Frame::close_stream(id, ack).into());
-    }
-
-    fn on_drop_stream(&mut self, stream_id: StreamId) {
+    fn on_drop_stream(&mut self, stream_id: StreamId) -> Option<Frame<()>> {
         let s = self.streams.remove(&stream_id).expect("stream not found");
 
         log::trace!("{}: removing dropped stream {}", self.id, stream_id);
@@ -526,10 +549,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Active<T> {
             }
             frame
         };
-        if let Some(f) = frame {
-            log::trace!("{}/{}: sending: {}", self.id, stream_id, f.header());
-            self.pending_frame.replace(f.into());
-        }
+        frame.map(Into::into)
     }
 
     /// Process the result of reading from the socket.
@@ -538,7 +558,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Active<T> {
     /// and return a corresponding error, which terminates the connection.
     /// Otherwise we process the frame and potentially return a new `Stream`
     /// if one was opened by the remote.
-    fn on_frame(&mut self, frame: Frame<()>) -> Result<Option<Stream>> {
+    fn on_frame(&mut self, frame: Frame<()>) -> Result<Action> {
         log::trace!("{}: received: {}", self.id, frame.header());
 
         if frame.header().flags().contains(header::ACK)
@@ -561,23 +581,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Active<T> {
             Tag::Ping => self.on_ping(&frame.into_ping()),
             Tag::GoAway => return Err(ConnectionError::Closed),
         };
-        match action {
-            Action::None => {}
-            Action::New(stream) => {
-                log::trace!("{}: new inbound {} of {}", self.id, stream, self);
-                return Ok(Some(stream));
-            }
-            Action::Ping(f) => {
-                log::trace!("{}/{}: pong", self.id, f.header().stream_id());
-                self.pending_frame.replace(f.into());
-            }
-            Action::Terminate(f) => {
-                log::trace!("{}: sending term", self.id);
-                self.pending_frame.replace(f.into());
-            }
-        }
-
-        Ok(None)
+        Ok(action)
     }
 
     fn on_data(&mut self, frame: Frame<Data>) -> Action {

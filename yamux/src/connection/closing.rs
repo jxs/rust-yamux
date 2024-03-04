@@ -6,6 +6,7 @@ use crate::{frame, StreamId};
 use futures::channel::mpsc;
 use futures::stream::{Fuse, SelectAll};
 use futures::{ready, AsyncRead, AsyncWrite, SinkExt, StreamExt};
+use std::collections::VecDeque;
 use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -15,7 +16,7 @@ use std::task::{Context, Poll};
 pub struct Closing<T> {
     state: State,
     stream_receivers: SelectAll<TaggedStream<StreamId, mpsc::Receiver<StreamCommand>>>,
-    pending_frame: Option<Frame<()>>,
+    pending_frames: VecDeque<Frame<()>>,
     socket: Fuse<frame::Io<T>>,
 }
 
@@ -25,13 +26,13 @@ where
 {
     pub(crate) fn new(
         stream_receivers: SelectAll<TaggedStream<StreamId, mpsc::Receiver<StreamCommand>>>,
-        pending_frame: Option<Frame<()>>,
+        pending_frames: VecDeque<Frame<()>>,
         socket: Fuse<frame::Io<T>>,
     ) -> Self {
         Self {
-            state: State::ClosingStreamReceiver,
+            state: State::FlushingPendingFrames,
             stream_receivers,
-            pending_frame,
+            pending_frames,
             socket,
         }
     }
@@ -48,6 +49,14 @@ where
 
         loop {
             match this.state {
+                State::FlushingPendingFrames => {
+                    ready!(this.socket.poll_ready_unpin(cx))?;
+
+                    match this.pending_frames.pop_front() {
+                        Some(frame) => this.socket.start_send_unpin(frame)?,
+                        None => this.state = State::ClosingStreamReceiver,
+                    }
+                }
                 State::ClosingStreamReceiver => {
                     for stream in this.stream_receivers.iter_mut() {
                         stream.inner_mut().close();
@@ -58,27 +67,19 @@ where
                 State::DrainingStreamReceiver => {
                     match this.stream_receivers.poll_next_unpin(cx) {
                         Poll::Ready(Some((_, Some(StreamCommand::SendFrame(frame))))) => {
-                            this.pending_frame.replace(frame.into());
+                            this.pending_frames.push_back(frame.into());
                         }
                         Poll::Ready(Some((id, Some(StreamCommand::CloseStream { ack })))) => {
-                            this.pending_frame
-                                .replace(Frame::close_stream(id, ack).into());
+                            this.pending_frames
+                                .push_back(Frame::close_stream(id, ack).into());
                         }
                         Poll::Ready(Some((_, None))) => {}
                         Poll::Pending | Poll::Ready(None) => {
                             // No more frames from streams, append `Term` frame and flush them all.
-                            this.pending_frame.replace(Frame::term().into());
-                            this.state = State::FlushingPendingFrames;
+                            this.pending_frames.push_back(Frame::term().into());
+                            this.state = State::ClosingSocket;
                             continue;
                         }
-                    }
-                }
-                State::FlushingPendingFrames => {
-                    ready!(this.socket.poll_ready_unpin(cx))?;
-
-                    match this.pending_frame.take() {
-                        Some(frame) => this.socket.start_send_unpin(frame)?,
-                        None => this.state = State::ClosingSocket,
                     }
                 }
                 State::ClosingSocket => {
@@ -92,8 +93,8 @@ where
 }
 
 enum State {
+    FlushingPendingFrames,
     ClosingStreamReceiver,
     DrainingStreamReceiver,
-    FlushingPendingFrames,
     ClosingSocket,
 }
