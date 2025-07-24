@@ -1,3 +1,8 @@
+# 0.13.2
+
+- Fix panic on frame io when the returned number of bytes from a write operation is bigger than the header size.
+  See [PR 202](https://github.com/libp2p/rust-yamux/pull/179).
+
 # 0.13.1
 
 - Fix WASM support using `instant::{Duration, Instant}` instead of `std::time::{Duration, Instant}`.
